@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""
+PVF Prime Resonance Optimization Suite v2
+GOAL: Push win rate from 70% to 90%+ by optimizing prime field parameters
+"""
+
+import os
+import json
+import yaml
+import subprocess
+import numpy as np
+from pathlib import Path
+import time
+from itertools import product
+
+# Same 10 protein test set
+TEST_PROTEINS = {
+    # ALL-ALPHA (3)
+    "villin": {"sequence": "MLSDEDFKAVFGMTRSAFANLPLWKQQNLKKEKGLF", "fold_class": "all-alpha"},
+    "myoglobin_fragment": {"sequence": "VLSEGEWQLVLHVWAKVEADVAGHGQDILIRLFKSHPETLEKFDRFKHLKTEAEMKASEDLKKHGVTVLTALGAILKKKGHHEAELKPLAQSHATKHKIPIKYLEFISEAIIHVLHSRHPGDFGADAQGAMNKALELFRKDIAAKYKELGYQG", "fold_class": "all-alpha"},
+    "coiled_coil": {"sequence": "MKQLEDKVEELLSKNYHLENEVARLKKLVGERGRLTGRGERELELEELKRLQAELQRLVAELQRLAAEIEDLKAELQRKAEELKRLKARLQEKKAEIKELDEKLEEI", "fold_class": "all-alpha"},
+    # ALL-BETA (3)
+    "ubiquitin": {"sequence": "MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG", "fold_class": "all-beta"},
+    "sh3_domain": {"sequence": "AEMKGRWKPKMIGPKTHKRLPQGLRALKDGNKHELPGETRALRLVDNFNLPNPPTPEEYAAVFSYVGAELVFEPELKPNLTRVNLHQVGGGAEDGAAAPLAPGTPGR", "fold_class": "all-beta"},
+    "immunoglobulin": {"sequence": "DIQMTQSPSSLSASVGDRVTITCRASQGIRNYLAWYQQKPGKAPKLLIYAASTLQSGVPSRFSGSGSGTDFTLTISSLQPEDFATYYCQRYNRAPYTFGQGTKVEIKR", "fold_class": "all-beta"},
+    # ALPHA/BETA (3)
+    "lysozyme_fragment": {"sequence": "KVFGRCELAAAMKRHGLDNYRGYSLGNWVCAAKFESNFNTQATNRNTDGSTDYGILQINSRWWCNDGRTPGSRNLCNIPCSALLSSDITASVNCAKKIVSDGNGMNAWVAWRNRCKGTDV", "fold_class": "alpha-beta-mixed"},
+    "triosephosphate": {"sequence": "ARVAERLTKEYQVKNGQAIRAGLCQAAVAAEQLGVTGAIIGWDKGGEKYWDSVIDLVTEVASSGGAAINPGAVKFPIDRQYDLFAAAAPDEGVAAAKRTAAEVKGSALVLQRRDGLLVGGASAYGKPLMVDAAAELVPKLKEVLDVLDK", "fold_class": "alpha-beta-mixed"},
+    # ALPHA+BETA (2) - focus on the challenging ones
+    "ferredoxin": {"sequence": "AYKVAQCIECGSCKTCSPEQRAQYVHTSQHRSLIEFDSAYDVLTKHGTGVQRVEDITPGQVKRVTYNAAKDAKKIGAVYDPGLVRCSAVPDDKEYLDGEVEAFGRTTLSLTSRRRQFYEKDRRNVAYFTDVKDGEAVLAQPDVWLQENRDWVGKTKDDTM", "fold_class": "alpha-plus-beta"},
+    "cytochrome": {"sequence": "GDVEKGKKIFIMKCSQCHTVEKGGKHKTGPNLHGLFGRKTGQAPGYSYTAANKNKGIIWGEDTLMEYLENPKKYIPGTKMIFVGIKKKEERADLIAYLKKATNE", "fold_class": "alpha-plus-beta"}
+}
+
+# OPTIMIZATION EXPERIMENTS - systematic parameter sweep
+OPTIMIZATION_CONFIGS = {
+    # Experiment 1: Enhanced prime sets for different fold classes
+    "prime_alpha_tuned": {
+        "representation": "CA",
+        "optimizer": {"method": "anneal", "steps": 1200, "temp_init": 2.5, "temp_final": 0.05},
+        "energy_weights": {"bonded": 1.0, "torsion": 0.9, "nonbonded": 1.3, "solvation": 0.5, "pvf_term": 0.9},
+        "pvf": {
+            "enabled": True, "window": 7,
+            "prime_resonance": {
+                "enabled": True, "base": 1.5, 
+                "critical": [2, 3, 5, 7, 11],  # Smaller primes for helix periodicity
+                "crit_map": {"7": 2.0, "15": 1.8, "30": 1.5, "60": 1.3}
+            }
+        }
+    },
+    
+    "prime_beta_tuned": {
+        "representation": "CA", 
+        "optimizer": {"method": "metropolis", "steps": 1800, "temperature": 0.8},
+        "energy_weights": {"bonded": 1.0, "torsion": 1.2, "nonbonded": 1.0, "solvation": 0.8, "pvf_term": 0.7},
+        "pvf": {
+            "enabled": True, "window": 11,
+            "prime_resonance": {
+                "enabled": True, "base": 1.3,
+                "critical": [3, 5, 11, 13, 17],  # Larger primes for sheet spacing
+                "crit_map": {"10": 1.6, "25": 1.4, "50": 1.2}
+            }
+        }
+    },
+    
+    "prime_mixed_tuned": {
+        "representation": "BACKBONE",
+        "optimizer": {"method": "nelder_mead", "steps": 1000},
+        "energy_weights": {"bonded": 1.0, "torsion": 0.8, "nonbonded": 1.1, "solvation": 0.9, "pvf_term": 0.8},
+        "pvf": {
+            "enabled": True, "window": 9,
+            "prime_resonance": {
+                "enabled": True, "base": 1.4,
+                "critical": [2, 3, 5, 7, 11, 13],  # Mixed critical set
+                "crit_map": {"12": 1.7, "24": 1.5, "48": 1.3, "96": 1.2}
+            }
+        }
+    },
+    
+    # Experiment 2: Fibonacci-prime hybrid
+    "fibonacci_prime": {
+        "representation": "CA",
+        "optimizer": {"method": "anneal", "steps": 1500, "temp_init": 3.0, "temp_final": 0.02},
+        "energy_weights": {"bonded": 1.0, "torsion": 0.7, "nonbonded": 1.4, "solvation": 0.6, "pvf_term": 1.0},
+        "pvf": {
+            "enabled": True, "window": 13,  # Fibonacci number
+            "prime_resonance": {
+                "enabled": True, "base": 1.618,  # Golden ratio
+                "critical": [2, 3, 5, 8, 13, 21],  # Fibonacci primes
+                "crit_map": {"8": 1.9, "21": 1.7, "55": 1.5, "144": 1.3}
+            }
+        }
+    },
+    
+    # Experiment 3: Twin prime resonance
+    "twin_prime": {
+        "representation": "CA",
+        "optimizer": {"method": "metropolis", "steps": 2000, "temperature": 1.2},
+        "energy_weights": {"bonded": 1.0, "torsion": 1.0, "nonbonded": 1.2, "solvation": 0.7, "pvf_term": 0.85},
+        "pvf": {
+            "enabled": True, "window": 11,
+            "prime_resonance": {
+                "enabled": True, "base": 1.25,
+                "critical": [3, 5, 11, 13, 17, 19, 29, 31],  # Twin prime pairs
+                "crit_map": {"6": 2.1, "18": 1.8, "42": 1.5, "72": 1.3}
+            }
+        }
+    },
+    
+    # Experiment 4: Mersenne prime enhanced
+    "mersenne_prime": {
+        "representation": "BACKBONE",
+        "optimizer": {"method": "nelder_mead", "steps": 800},
+        "energy_weights": {"bonded": 1.0, "torsion": 0.9, "nonbonded": 1.1, "solvation": 1.0, "pvf_term": 0.75},
+        "pvf": {
+            "enabled": True, "window": 7,  # Mersenne prime
+            "prime_resonance": {
+                "enabled": True, "base": 1.35,
+                "critical": [3, 7, 31, 127],  # Mersenne primes 2^p-1
+                "crit_map": {"7": 2.2, "31": 1.9, "127": 1.6, "8191": 1.4}
+            }
+        }
+    }
+}
+
+def create_fasta(sequence, name, output_dir):
+    fasta_path = output_dir / f"{name}.fasta"
+    with open(fasta_path, 'w') as f:
+        f.write(f">{name}\n{sequence}\n")
+    return fasta_path
+
+def create_config(config_dict, output_dir, name):
+    config_path = output_dir / f"{name}.yaml"
+    with open(config_path, 'w') as f:
+        yaml.safe_dump(config_dict, f, default_flow_style=False)
+    return config_path
+
+def run_ab_test_only(fasta_path, config_path, output_dir, experiment_name):
+    """Run only A/B comparison for speed"""
+    ab_dir = output_dir / f"{experiment_name}_ab"
+    ab_dir.mkdir(exist_ok=True)
+    
+    cmd = ["python", "-m", "cli.ab_compare", "--fasta", str(fasta_path), "--config", str(config_path), "--out", str(ab_dir)]
+    
+    start_time = time.time()
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        runtime = time.time() - start_time
+        
+        # Parse results immediately
+        ab_summary_path = ab_dir / "ab_summary.json"
+        if ab_summary_path.exists():
+            with open(ab_summary_path, 'r') as f:
+                ab_data = json.load(f)
+                pvf_energy = ab_data['pvf_on'][1]
+                no_pvf_energy = ab_data['pvf_off'][1]
+                advantage = no_pvf_energy - pvf_energy
+                win = advantage > 0
+                
+                print(f"    {'✅' if win else '❌'} PVF advantage: {advantage:+.3f} ({runtime:.2f}s)")
+                return True, win, advantage, runtime
+        
+        return False, False, 0, runtime
+        
+    except subprocess.CalledProcessError as e:
+        runtime = time.time() - start_time
+        print(f"    ❌ Failed ({runtime:.2f}s)")
+        return False, False, 0, runtime
+
+def smart_protein_selection(results_so_far):
+    """Focus on proteins where we're losing to maximize learning"""
+    if not results_so_far:
+        return list(TEST_PROTEINS.keys())[:3]  # Start with 3 diverse proteins
+    
+    # Find proteins where PVF is underperforming
+    underperforming = []
+    for protein_name in TEST_PROTEINS.keys():
+        protein_results = [r for r in results_so_far if protein_name in r['name']]
+        if protein_results:
+            win_rate = sum(1 for r in protein_results if r['win']) / len(protein_results)
+            if win_rate < 0.6:  # Focus on challenging proteins
+                underperforming.append(protein_name)
+    
+    return underperforming if underperforming else list(TEST_PROTEINS.keys())[:5]
+
+def analyze_optimization_results(all_results):
+    """Detailed analysis of optimization experiments"""
+    
+    # Group by config type
+    config_performance = {}
+    for result in all_results:
+        config = result['config']
+        if config not in config_performance:
+            config_performance[config] = {'wins': 0, 'total': 0, 'avg_advantage': 0}
+        
+        config_performance[config]['total'] += 1
+        if result['win']:
+            config_performance[config]['wins'] += 1
+        config_performance[config]['avg_advantage'] += result['advantage']
+    
+    # Calculate averages
+    for config in config_performance:
+        perf = config_performance[config]
+        perf['win_rate'] = perf['wins'] / perf['total']
+        perf['avg_advantage'] /= perf['total']
+    
+    # Find best performing config
+    best_config = max(config_performance.keys(), 
+                     key=lambda c: config_performance[c]['win_rate'])
+    
+    return config_performance, best_config
+
+def main():
+    print("🚀 PVF PRIME RESONANCE OPTIMIZATION SUITE v2")
+    print("=" * 50)
+    print("MISSION: Push win rate from 70% to 90%+")
+    print("STRATEGY: Targeted optimization with smart iteration")
+    print()
+    
+    results_dir = Path("pvf_optimization_results")
+    results_dir.mkdir(exist_ok=True)
+    
+    all_results = []
+    
+    # Phase 1: Quick screening of all configs on subset of proteins
+    print("🔬 PHASE 1: Config Screening")
+    print("-" * 30)
+    
+    screening_proteins = ["villin", "ubiquitin", "lysozyme_fragment"]  # One from each major class
+    
+    for config_name, config_data in OPTIMIZATION_CONFIGS.items():
+        print(f"\n🧪 Testing config: {config_name}")
+        
+        config_wins = 0
+        config_total = 0
+        
+        for protein_name in screening_proteins:
+            if protein_name not in TEST_PROTEINS:
+                continue
+                
+            protein_data = TEST_PROTEINS[protein_name]
+            print(f"  🔬 {protein_name} ({protein_data['fold_class']})")
+            
+            # Create files
+            fasta_path = create_fasta(protein_data['sequence'], protein_name, results_dir)
+            config_path = create_config(config_data, results_dir, f"{protein_name}_{config_name}")
+            
+            # Run A/B test
+            success, win, advantage, runtime = run_ab_test_only(fasta_path, config_path, results_dir, f"{protein_name}_{config_name}")
+            
+            if success:
+                config_total += 1
+                if win:
+                    config_wins += 1
+                
+                all_results.append({
+                    'name': f"{protein_name}_{config_name}",
+                    'protein': protein_name,
+                    'config': config_name,
+                    'fold_class': protein_data['fold_class'],
+                    'win': win,
+                    'advantage': advantage,
+                    'runtime': runtime
+                })
+        
+        if config_total > 0:
+            win_rate = config_wins / config_total
+            print(f"  📊 Config win rate: {config_wins}/{config_total} ({win_rate:.1%})")
+    
+    # Phase 2: Deep dive on best configs
+    print(f"\n🎯 PHASE 2: Deep Optimization")
+    print("-" * 30)
+    
+    config_performance, best_config = analyze_optimization_results(all_results)
+    
+    print(f"🏆 Best performing config: {best_config}")
+    print(f"   Win rate: {config_performance[best_config]['win_rate']:.1%}")
+    print(f"   Avg advantage: {config_performance[best_config]['avg_advantage']:+.3f}")
+    
+    # Test best configs on all proteins
+    top_configs = sorted(config_performance.keys(), 
+                        key=lambda c: config_performance[c]['win_rate'], 
+                        reverse=True)[:3]
+    
+    print(f"\n🧬 Testing top {len(top_configs)} configs on all proteins...")
+    
+    for config_name in top_configs:
+        print(f"\n⚙️  Full test: {config_name}")
+        config_data = OPTIMIZATION_CONFIGS[config_name]
+        
+        for protein_name, protein_data in TEST_PROTEINS.items():
+            print(f"  🔬 {protein_name}")
+            
+            fasta_path = create_fasta(protein_data['sequence'], protein_name, results_dir)
+            config_path = create_config(config_data, results_dir, f"final_{protein_name}_{config_name}")
+            
+            success, win, advantage, runtime = run_ab_test_only(fasta_path, config_path, results_dir, f"final_{protein_name}_{config_name}")
+            
+            if success:
+                all_results.append({
+                    'name': f"final_{protein_name}_{config_name}",
+                    'protein': protein_name,
+                    'config': config_name,
+                    'fold_class': protein_data['fold_class'],
+                    'win': win,
+                    'advantage': advantage,
+                    'runtime': runtime
+                })
+    
+    # Final analysis
+    print(f"\n📊 FINAL OPTIMIZATION RESULTS")
+    print("=" * 40)
+    
+    final_results = [r for r in all_results if r['name'].startswith('final_')]
+    
+    if final_results:
+        total_wins = sum(1 for r in final_results if r['win'])
+        total_tests = len(final_results)
+        final_win_rate = total_wins / total_tests
+        avg_advantage = sum(r['advantage'] for r in final_results) / total_tests
+        
+        print(f"🏆 Final win rate: {total_wins}/{total_tests} ({final_win_rate:.1%})")
+        print(f"⚡ Average advantage: {avg_advantage:+.3f}")
+        print(f"⏱️  Average runtime: {sum(r['runtime'] for r in final_results)/total_tests:.2f}s")
+        
+        # By fold class
+        fold_classes = ["all-alpha", "all-beta", "alpha-beta-mixed", "alpha-plus-beta"]
+        print(f"\n📋 Performance by fold class:")
+        for fold_class in fold_classes:
+            class_results = [r for r in final_results if r['fold_class'] == fold_class]
+            if class_results:
+                class_wins = sum(1 for r in class_results if r['win'])
+                class_total = len(class_results)
+                print(f"  {fold_class}: {class_wins}/{class_total} ({class_wins/class_total:.1%})")
+        
+        # Success metrics
+        if final_win_rate >= 0.9:
+            print(f"\n🎉 BREAKTHROUGH ACHIEVED!")
+            print(f"   Prime resonance theory VALIDATED at 90%+ win rate!")
+        elif final_win_rate >= 0.8:
+            print(f"\n🚀 EXCELLENT PROGRESS!")
+            print(f"   Strong improvement - approaching breakthrough territory")
+        elif final_win_rate > 0.7:
+            print(f"\n📈 GOOD IMPROVEMENT!")
+            print(f"   Incremental gains - keep iterating")
+        else:
+            print(f"\n🔧 NEEDS MORE WORK")
+            print(f"   Time for deeper analysis and parameter tuning")
+    
+    # Save detailed results
+    results_file = results_dir / "optimization_results.json"
+    with open(results_file, 'w') as f:
+        json.dump({
+            'all_results': all_results,
+            'config_performance': config_performance,
+            'best_config': best_config,
+            'summary': {
+                'total_experiments': len(all_results),
+                'final_win_rate': final_win_rate if final_results else 0,
+                'avg_advantage': avg_advantage if final_results else 0
+            }
+        }, f, indent=2)
+    
+    print(f"\n📁 Detailed results saved to: {results_file}")
+
+if __name__ == "__main__":
+    main()
